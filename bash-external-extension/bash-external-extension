@@ -1,0 +1,133 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# get extension name (as name of THIS script)
+OWN_FILENAME="$(basename $0)"
+LAMBDA_EXTENSION_NAME="$OWN_FILENAME"
+
+# get base url for extension api requests
+BASE_URL="http://${AWS_LAMBDA_RUNTIME_API}/2020-01-01/extension"
+
+HEADERS_FILE=headers.txt
+RESPONSE_FILE=response.txt
+
+function request_register()
+{
+  LAMBDA_EXTENSION_ID=$(\
+    curl "${BASE_URL}/register" -sS -LD "$HEADERS_FILE" \
+    -X POST -H "Content-Type: application/json" -H "Lambda-Extension-Name: $LAMBDA_EXTENSION_NAME" \
+    -d '{"events":["INVOKE","SHUTDOWN"]}' \
+    -w '%header{lambda-extension-identifier}' \
+    -o "$RESPONSE_FILE" \
+  )
+
+  echo "Got identifier: $LAMBDA_EXTENSION_ID"
+  echo "From headers:"
+  cat "$HEADERS_FILE"
+
+  REGISTER_RETVAL=$?
+  if [ $REGISTER_RETVAL -ne 0 ]; then
+    echo "FATAL: Register appears to have failed:"
+    cat "$RESPONSE_FILE"
+    exit 1
+  fi
+}
+
+function request_next()
+{
+  curl "${BASE_URL}/event/next" -sS -LD "$HEADERS_FILE" \
+  -X GET -H "Content-Type: application/json" -H "Lambda-Extension-Identifier: $LAMBDA_EXTENSION_ID" \
+  -o "$RESPONSE_FILE"
+
+  NEXT_EVENT=$(cat "$RESPONSE_FILE")
+
+  NEXT_RETVAL=$?
+  if [ $NEXT_RETVAL -ne 0 ]; then
+    echo "FATAL: Next appears to have failed:"
+    echo "$NEXT_EVENT"
+    exit 2;
+  fi
+
+  echo "Got next response:"
+  echo $NEXT_EVENT
+  echo "With headers:"
+  cat "$HEADERS_FILE"
+}
+
+function handle_invoke()
+{
+  # we should have a next event for function invocation
+  echo "Handling invoke event:"
+  echo "$1" | jq
+  # log a metric
+  aws cloudwatch put-metric-data \
+  --metric-name Invocations --namespace "ACME/${ENV_NAME}/Lambda" \
+  --unit Count --value 1
+}
+
+function handle_shutdown()
+{
+  # if first arg is blank, assume we trapped a signal
+  if [ -z $1 ]; then
+    echo "Handling signal: $2"
+  # otherwise we should have a next event
+  else
+    echo "Handling event:"
+    echo "$1" | jq
+    # pluck the shutdown reason
+    SHUTDOWN_REASON=$(echo "$1" | jq -r '.shutdownReason')
+    # and log the appropriate metric
+    case "$SHUTDOWN_REASON" in
+      'TIMEOUT')
+        aws cloudwatch put-metric-data \
+        --metric-name Timeout --namespace "ACME/${ENV_NAME}/Lambda" \
+        --unit Count --value 1
+        ;;
+      'FAILURE')
+        aws cloudwatch put-metric-data \
+        --metric-name Error --namespace "ACME/${ENV_NAME}/Lambda" \
+        --unit Count --value 1
+        ;;
+    esac
+  fi
+  # either way, shut the door on our way out
+  exit 0
+}
+
+function trap_sigint()
+{
+  handle_shutdown '' 'SIGINT'
+}
+
+function trap_sigterm()
+{
+  handle_shutdown '' 'SIGTERM'
+}
+
+# register with api and get extension identifier
+request_register
+
+trap trap_sigint SIGINT
+trap trap_sigterm SIGTERN
+
+while true
+do
+  # make /next request
+  request_next
+  # pluck out the event type
+  EVENT_TYPE=$(echo "$NEXT_EVENT" | jq -r '.eventType')
+  # and take appropriate action for the event by type
+  case "$EVENT_TYPE" in
+    'SHUTDOWN')
+      handle_shutdown "$NEXT_EVENT"
+      ;;
+    'INVOKE')
+      handle_invoke "$NEXT_EVENT"
+      ;;
+    *)
+      echo "FATAL: Unknown eventType: $EVENT_TYPE"
+      exit 3
+      ;;
+  esac
+done
